@@ -1,15 +1,14 @@
-# app/main.py
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict
 import json
+import faiss
+import pickle
+from typing import List, Dict
+from app.rag import retrieve_chunks, query_book, stream_answer
 
-from app.rag import init_store, query_book, retrieve_chunks
-import ollama
-
-app = FastAPI(title="Book RAG Backend (FAISS)")
+app = FastAPI(title="Book RAG Backend (FAISS + Groq Llama)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,81 +27,55 @@ app.add_middleware(
 class QuestionRequest(BaseModel):
     question: str
 
+# Store loaded data on app.state
 @app.on_event("startup")
-def on_startup():
-    # builds embeddings + FAISS index in memory
-    init_store("data/meditations.txt")
+def _load_index_and_chunks():
+    try:
+        app.state.faiss_index = faiss.read_index("data/faiss_index.bin")
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to read data/faiss_index.bin. "
+            "Run `python -m scripts.build_index` first."
+        ) from e
+
+    try:
+        with open("data/chunks.pkl", "rb") as f:
+            app.state.chunks = pickle.load(f)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to read data/chunks.pkl. "
+            "Run `python -m scripts.build_index` first."
+        ) from e
 
 def sse_event(event: str, data) -> str:
-    """Format a Server-Sent Event line."""
     payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
 
 @app.get("/ask-stream")
 def ask_stream(question: str):
-    """
-    SSE stream:
-      - meta: { chunks: [{id, text}, ...] }
-      - token: { text: "..." }  (small deltas)
-      - done: {}
-    """
     def gen():
         try:
-            # 1) Retrieve relevant chunks first
-            top = retrieve_chunks(question, k=5)
-
-            # 2) Send metadata so the UI can show Sources immediately
-            meta = {"chunks": [{"id": c["id"], "text": c["text"]} for c in top]}
-            yield sse_event("meta", meta)
-
-            # 3) Build prompt from chunks
-            context = "\n\n---\n\n".join([c["text"] for c in top])
-            prompt = f"""You are a helpful assistant answering questions using only the provided context from *Meditations* by Marcus Aurelius.
-
-Context:
----
-{context}
----
-
-Instructions:
-- Only use information from the context above.
-- If the answer is not in the context, reply: "The book does not say directly."
-- Be concise and faithful to the text.
-
-Question: {question}
-Answer:"""
-
-            # 4) Stream tokens from Ollama
-            for part in ollama.chat(
-                model="mistral",
-                messages=[{"role": "user", "content": prompt}],
-                stream=True,  # <- streaming on
-            ):
-                delta = part.get("message", {}).get("content", "")
-                if delta:
-                    yield sse_event("token", {"text": delta})
-
-            # 5) Done
+            top = retrieve_chunks(question, app.state.chunks, app.state.faiss_index, k=5)
+            # Send supporting chunks first
+            yield sse_event("meta", {"chunks": [{"id": c["id"], "text": c["text"]} for c in top]})
+            # Stream tokens
+            for delta in stream_answer(question, top):
+                yield sse_event("token", {"text": delta})
             yield sse_event("done", {})
-
         except Exception as e:
-            # Send error to client then close
             yield sse_event("error", {"message": str(e)})
 
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        # CORS is handled by middleware; extra header helps some proxies:
         "X-Accel-Buffering": "no",
     }
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
-
 @app.post("/ask")
 def ask(req: QuestionRequest):
     try:
-        answer, chunks = query_book(req.question, k=5)
-        # Only return id+text for the frontend (score optional)
+        answer, chunks = query_book(req.question, app.state.chunks, app.state.faiss_index, k=5)
         return {"answer": answer, "chunks": [{"id": c["id"], "text": c["text"]} for c in chunks]}
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))

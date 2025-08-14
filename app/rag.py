@@ -1,97 +1,78 @@
-# app/rag.py
-from pathlib import Path
-from typing import List, Dict, Tuple, Union, Optional
-import numpy as np
+import os
+from typing import List, Dict, Tuple
 import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
-import ollama
+from groq import Groq
+from dotenv import load_dotenv
 
-from app.utils.chunking import chunk_paragraphs
+load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_BOOK = BASE_DIR / "data" / "meditations.txt"
+# ---- Embeddings ----
+# Use same model here and in scripts/build_index.py
+_EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+_embedding_model = SentenceTransformer(_EMBED_MODEL_NAME)
 
-# ----- Loading & Chunking -----
+# ---- Groq client ----
+_GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not _GROQ_API_KEY:
+    raise RuntimeError("GROQ_API_KEY not found in environment variables.")
+_groq = Groq(api_key=_GROQ_API_KEY)
 
-def load_chunks(path: Optional[Union[str, Path]] = None) -> List[str]:
-    book_path = Path(path) if path else DEFAULT_BOOK
-    if not book_path.is_absolute():
-        book_path = (BASE_DIR / book_path).resolve()
-    if not book_path.exists():
-        raise FileNotFoundError(f"Book file not found at: {book_path}")
-    text = book_path.read_text(encoding="utf-8")
-    chunks = chunk_paragraphs(text, overlap=1)  # 3-paragraph chunks w/ small overlap
+# ---- Chunking ----
+def chunk_text(text: str, chunk_size: int = 900, overlap: int = 150) -> List[str]:
+    """
+    Simple overlapping character-based chunking.
+    Tune sizes as needed; keep consistent with index build.
+    """
+    chunks: List[str] = []
+    start = 0
+    n = len(text)
+    while start < n:
+        end = min(start + chunk_size, n)
+        chunks.append(text[start:end])
+        if end >= n:
+            break
+        start += chunk_size - overlap
     return chunks
 
-# ----- Embeddings & Index -----
-
-_embedder: Optional[SentenceTransformer] = None
-_index: Optional[faiss.Index] = None
-_index_ids: Optional[np.ndarray] = None
-_chunks: List[str] = []
-
-def _get_embedder() -> SentenceTransformer:
-    global _embedder
-    if _embedder is None:
-        # small, fast, good quality
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    return _embedder
-
-def _normalize_rows(v: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
-    return v / norms
-
-def build_index(chunks: List[str]) -> Tuple[faiss.Index, np.ndarray]:
+# ---- Build FAISS (used by the build script; not used at runtime on Render) ----
+def build_faiss_index(chunks: List[str]) -> faiss.Index:
     """
-    Build a cosine-similarity FAISS index using inner product on L2-normalized vectors.
-    Returns (index, ids) where ids map FAISS positions -> chunk indices.
+    Build a FAISS index (L2) over normalized embeddings.
     """
-    embedder = _get_embedder()
-    embs = embedder.encode(chunks, batch_size=64, show_progress_bar=True)
-    embs = embs.astype("float32")
-    embs = _normalize_rows(embs)
+    embeddings = _embedding_model.encode(
+        chunks, convert_to_numpy=True, normalize_embeddings=True
+    )
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeddings.astype("float32"))
+    return index
 
-    dim = embs.shape[1]
-    index = faiss.IndexFlatIP(dim)  # cosine if inputs are normalized
-    index.add(embs)
-    ids = np.arange(len(chunks), dtype=np.int64)
-    return index, ids
-
-def init_store(book_path: Optional[Union[str, Path]] = None) -> None:
-    """Load chunks and build FAISS index on startup."""
-    global _chunks, _index, _index_ids
-    _chunks = load_chunks(book_path)
-    _index, _index_ids = build_index(_chunks)
-    print(f"[rag] Loaded {_index.ntotal} embeddings for {_index_ids.size} chunks.")
-
-# ----- Retrieval -----
-
-def retrieve_chunks(query: str, k: int = 5) -> List[Dict]:
+# ---- Retrieval ----
+def retrieve_chunks(query: str, chunks: List[str], index: faiss.Index, k: int = 5) -> List[Dict]:
     """
-    Search top-k similar chunks via FAISS and return [{id, text}, ...].
+    Search top-k similar chunks. Returns [{id, text, score}, ...]
     """
-    if _index is None or _index_ids is None or not _chunks:
-        raise RuntimeError("Index not initialized. Call init_store() on startup.")
-
-    q_emb = _get_embedder().encode([query]).astype("float32")
-    q_emb = _normalize_rows(q_emb)
-
-    # FAISS returns distances (inner product) and indices
-    D, I = _index.search(q_emb, k)
-    top = []
-    for pos, score in zip(I[0], D[0]):
+    q_emb = _embedding_model.encode(
+        [query], convert_to_numpy=True, normalize_embeddings=True
+    ).astype("float32")
+    D, I = index.search(q_emb, k)
+    out: List[Dict] = []
+    for pos, dist in zip(I[0], D[0]):
         if pos == -1:
             continue
-        chunk_id = int(_index_ids[pos])
-        top.append({"id": chunk_id, "text": _chunks[chunk_id], "score": float(score)})
-    return top
+        out.append({
+            "id": int(pos),
+            "text": chunks[pos],
+            "score": float(dist)
+        })
+    return out
 
-# ----- Generation -----
-
-def generate_answer(question: str, top_chunks: List[Dict]) -> str:
+# ---- Prompting ----
+def _build_prompt(question: str, top_chunks: List[Dict]) -> str:
     context = "\n\n---\n\n".join([c["text"] for c in top_chunks])
-
-    prompt = f"""You are a helpful assistant answering questions using only the provided context from *Meditations* by Marcus Aurelius.
+    return f"""You are a helpful assistant answering questions using only the provided context from *Meditations* by Marcus Aurelius.
 
 Context:
 ---
@@ -100,19 +81,37 @@ Context:
 
 Instructions:
 - Only use information from the context above.
-- If the answer is not in the context, reply: "The book does not say directly."
+- If the answer is not in the context, reply exactly: "The book does not say directly."
 - Be concise and faithful to the text.
 
 Question: {question}
 Answer:"""
 
-    resp = ollama.chat(
-        model="mistral",
+# ---- Generation (non-streaming) ----
+def generate_answer(question: str, top_chunks: List[Dict]) -> str:
+    prompt = _build_prompt(question, top_chunks)
+    resp = _groq.chat.completions.create(
+        model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
+        stream=False,
     )
-    return resp["message"]["content"]
+    return resp.choices[0].message.content
 
-def query_book(question: str, k: int = 5) -> Tuple[str, List[Dict]]:
-    top = retrieve_chunks(question, k=k)
+# ---- Generation (streaming) ----
+def stream_answer(question: str, top_chunks: List[Dict]):
+    prompt = _build_prompt(question, top_chunks)
+    stream = _groq.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+# ---- High-level convenience (non-streaming) ----
+def query_book(question: str, chunks: List[str], index: faiss.Index, k: int = 5) -> Tuple[str, List[Dict]]:
+    top = retrieve_chunks(question, chunks, index, k=k)
     answer = generate_answer(question, top)
     return answer, top

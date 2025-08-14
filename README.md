@@ -1,20 +1,16 @@
-# Book RAG Backend
+# Book RAG Backend (Groq + Llama + FAISS)
 
-FastAPI backend for the Book Q&A Bot using a local Ollama (Mistral) model.
+FastAPI backend that answers questions about a book using:
 
-🚀 To run:
+- FAISS retrieval (prebuilt index)
+- HuggingFace embeddings (`all-MiniLM-L6-v2`)
+- Groq Llama (`llama-3.1-8b-instant`)
+- SSE streaming (`/ask-stream`)
+
+## Setup
+
+1. Install deps
 
 ```bash
-cd book-rag-backend
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-
-uvicorn app.main:app --reload
-```
-
-If you get "Address already in use" error, use a different port:
-
-```bash
-uvicorn app.main:app --reload --port 8001
 ```

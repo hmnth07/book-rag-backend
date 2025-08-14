@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-pydantic
-ollama
+python-dotenv
+groq
 sentence-transformers
+torch
 faiss-cpu
 numpy
-groq
+pydantic
