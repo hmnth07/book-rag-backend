@@ -17,7 +17,7 @@ app = FastAPI(title="Book RAG Backend (FAISS + Groq)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust to your frontend domain
+    allow_origins=["https://marcusaurelius-chat.vercel.app/", "http://localhost:5137"],  # Adjust to your frontend domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
